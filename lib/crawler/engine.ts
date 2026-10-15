@@ -13,6 +13,7 @@ import {
   RobotsPolicy,
   type RobotsFetch,
   type RobotsReport,
+  type SkipReason,
 } from "./robots";
 
 const ABSOLUTE_MAX_PAGES = 2000;
@@ -680,16 +681,21 @@ async function fetchPage(url: string, hooks: HopHooks): Promise<{
   }
 }
 
+/** Text body, null on a non-2xx answer. Throws on a failed or blocked hop. */
+async function readText(url: string, hooks: HopHooks): Promise<string | null> {
+  const r = await fetchPublic(url, { "User-Agent": USER_AGENT }, hooks);
+  try {
+    if (!r.res.ok) return null;
+    return await r.res.text();
+  } finally {
+    r.done();
+  }
+}
+
 /** Sitemap (or any text) body, or null on any failure or blocked hop. */
 export async function fetchText(url: string, hooks: HopHooks = {}): Promise<string | null> {
   try {
-    const r = await fetchPublic(url, { "User-Agent": USER_AGENT }, hooks);
-    try {
-      if (!r.res.ok) return null;
-      return await r.res.text();
-    } finally {
-      r.done();
-    }
+    return await readText(url, hooks);
   } catch {
     return null;
   }
@@ -1043,24 +1049,53 @@ async function executeCrawl(
 
   /* ---- Sitemap discovery ---- */
   let sitemapUrls: string[] = [];
+  // Sitemap: lines are free text; a malformed one is ignored, not fatal. One
+  // that names a default location is checked (and counted) once.
   const sitemapCandidates = [
-    // Sitemap: lines are free text; a malformed one is ignored, not fatal.
     ...seedRobots.sitemaps.filter(isHttpUrl),
     `${origin}/sitemap.xml`,
     `${origin}/sitemap_index.xml`,
   ];
+  /** Sitemaps already handled, by normalized URL: each is checked and counted once. */
+  const sitemapsSeen = new Set<string>();
+  /** The first sitemap robots.txt kept the crawler from, for the report. */
+  let sitemapSkip = null as { url: string; verdict: SkipReason } | null;
+  /**
+   * A sitemap's body, or null. A sitemap robots.txt keeps the crawler from,
+   * directly or at a redirect hop, is counted like any other skipped URL. A
+   * URL seen before (a Sitemap: line naming a default location, an index
+   * listing another candidate) is not requested or counted again; it is
+   * fetched as written.
+   */
+  const sitemapText = async (url: string): Promise<string | null> => {
+    const key = normalizeUrl(url, origin) ?? url;
+    if (sitemapsSeen.has(key)) return null;
+    sitemapsSeen.add(key);
+    if (!(await allowed(url))) {
+      sitemapSkip ??= { url, verdict: (await robots.check(url)) as SkipReason };
+      return null;
+    }
+    try {
+      return await readText(url, hooks);
+    } catch (error) {
+      if (error instanceof RobotsBlockedError || error instanceof CrawlDelayStopError) {
+        const verdict = error instanceof RobotsBlockedError ? error.verdict : "host-skipped";
+        await robots.skip(url, verdict, error.url !== url ? error.url : undefined);
+        sitemapSkip ??= { url, verdict };
+      }
+      return null;
+    } finally {
+      await recordProgress(0);
+    }
+  };
 
   for (const smUrl of sitemapCandidates) {
-    if (!(await allowed(smUrl))) continue;
-    const xml = await fetchText(smUrl, hooks);
-    await recordProgress(0);
+    const xml = await sitemapText(smUrl);
     if (!xml) continue;
     if (xml.includes("<sitemapindex")) {
       const childSitemaps = parseSitemapUrls(xml, origin).slice(0, 5);
       for (const child of childSitemaps) {
-        if (!(await allowed(child))) continue;
-        const childXml = await fetchText(child, hooks);
-        await recordProgress(0);
+        const childXml = await sitemapText(child);
         if (childXml) sitemapUrls.push(...parseSitemapUrls(childXml, origin));
       }
     } else {
@@ -1072,13 +1107,16 @@ async function executeCrawl(
   sitemapUrls = [...new Set(sitemapUrls.filter((u) => sameHost(u, seedUrl)))];
   if (sitemapUrls.length === 0) {
     issues.push({
-      url: `${origin}/sitemap.xml`,
+      url: sitemapSkip?.url ?? `${origin}/sitemap.xml`,
       type: "MISSING_SITEMAP",
       severity: "WARNING",
-      message: "No sitemap.xml found",
-      details: REMEDIATION.MISSING_SITEMAP
-        ? { howToFix: REMEDIATION.MISSING_SITEMAP.howToFix }
-        : {},
+      message:
+        sitemapSkip?.verdict === "disallowed"
+          ? "Sitemap blocked by robots.txt"
+          : sitemapSkip
+            ? "Sitemap not fetched, robots.txt skipped its host"
+            : "No sitemap.xml found",
+      details: { howToFix: (sitemapSkip ? REMEDIATION.SITEMAP_BLOCKED : REMEDIATION.MISSING_SITEMAP)?.howToFix },
     });
   } else {
     // Seed queue from sitemap
@@ -1138,7 +1176,7 @@ async function executeCrawl(
         continue;
       }
       if (error instanceof CrawlDelayStopError) {
-        await robots.skip(url, "host-skipped");
+        await robots.skip(url, "host-skipped", error.url !== url ? error.url : undefined);
         continue;
       }
 

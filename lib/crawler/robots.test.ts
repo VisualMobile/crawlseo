@@ -712,3 +712,225 @@ describe("Crawl-delay", () => {
     expect(seq[seq.length - 1].at - seq[0].at).toBeLessThan(5000);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Sitemaps, redirects onto a stopped origin, percent-encoding        */
+/* ------------------------------------------------------------------ */
+
+describe("sitemaps and robots.txt", () => {
+  it("checks and counts a Sitemap: line equal to the default /sitemap.xml once", async () => {
+    routes = {
+      "https://example.com/robots.txt": text(
+        "User-agent: *\nDisallow: /sitemap.xml\nSitemap: https://example.com/sitemap.xml\n"
+      ),
+      "https://example.com/": page("Home"),
+    };
+
+    await crawl();
+
+    expect(report()?.disallowed).toBe(1);
+    expect(report()?.skipped).toBe(1);
+    expect(report()?.samples).toEqual([{ url: "https://example.com/sitemap.xml" }]);
+  });
+
+  it("fetches a Sitemap: line equal to the default /sitemap.xml once", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nAllow: /\nSitemap: https://example.com/sitemap.xml\n"),
+      "https://example.com/": page("Home"),
+      "https://example.com/sitemap.xml": xml([]),
+    };
+
+    await crawl();
+
+    expect(callsTo("https://example.com/sitemap.xml")).toHaveLength(1);
+  });
+
+  it("counts a sitemap that redirects into a disallowed path as blocked by robots.txt", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nDisallow: /private\n"),
+      "https://example.com/": page("Home"),
+      "https://example.com/sitemap.xml": redirect("https://example.com/private/sitemap.xml"),
+      "https://example.com/private/sitemap.xml": xml(["https://example.com/a"]),
+    };
+
+    await crawl();
+
+    expect(fetched("https://example.com/private/sitemap.xml")).toBe(false);
+    expect(report()?.disallowed).toBe(1);
+    expect(report()?.samples).toEqual([
+      { url: "https://example.com/sitemap.xml", redirectedTo: "https://example.com/private/sitemap.xml" },
+    ]);
+    const missing = store.issues.filter((i) => i.type === "MISSING_SITEMAP");
+    expect(missing).toMatchObject([{ url: "https://example.com/sitemap.xml", message: "Sitemap blocked by robots.txt" }]);
+  });
+
+  it("checks and counts a sitemap once when an index lists another candidate", async () => {
+    routes = {
+      "https://example.com/robots.txt": text(
+        "User-agent: *\nDisallow: /sitemap.xml\nSitemap: https://example.com/sitemap_index.xml\n"
+      ),
+      "https://example.com/": page("Home"),
+      "https://example.com/sitemap_index.xml": () =>
+        new Response(
+          `<?xml version="1.0"?><sitemapindex><sitemap><loc>https://example.com/sitemap.xml</loc></sitemap></sitemapindex>`,
+          { status: 200, headers: { "content-type": "application/xml" } }
+        ),
+    };
+
+    await crawl();
+
+    expect(callsTo("https://example.com/sitemap_index.xml")).toHaveLength(1);
+    expect(report()?.disallowed).toBe(1);
+    expect(report()?.samples).toEqual([{ url: "https://example.com/sitemap.xml" }]);
+  });
+
+  it("fetches a Sitemap: line as written", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nAllow: /\nSitemap: https://example.com/sitemaps/\n"),
+      "https://example.com/": page("Home"),
+      "https://example.com/sitemaps/": xml(["https://example.com/a"]),
+      "https://example.com/a": page("A"),
+    };
+
+    await crawl();
+
+    expect(fetched("https://example.com/sitemaps/")).toBe(true);
+    expect(fetched("https://example.com/a")).toBe(true);
+  });
+
+  it("tells how to unblock a sitemap robots.txt blocks, not how to create one", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nDisallow: /sitemap\n"),
+      "https://example.com/": page("Home"),
+    };
+
+    await crawl();
+
+    expect(store.issues).toContainEqual(
+      expect.objectContaining({
+        type: "MISSING_SITEMAP",
+        details: { howToFix: expect.stringMatching(/^Allow the sitemap URL in robots\.txt/) },
+      })
+    );
+  });
+
+  it("says the sitemap was not fetched when robots.txt skipped its host", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("busy", 503),
+      "https://example.com/sitemap.xml": xml(["https://example.com/a"]),
+    };
+
+    await crawl();
+
+    expect(fetched("https://example.com/sitemap.xml")).toBe(false);
+    expect(store.issues.filter((i) => i.type === "MISSING_SITEMAP").map((i) => i.message)).toEqual([
+      "Sitemap not fetched, robots.txt skipped its host",
+    ]);
+  });
+
+  it("names a sitemap that robots.txt disallows directly in the sitemap issue", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nDisallow: /sitemap\n"),
+      "https://example.com/": page("Home"),
+    };
+
+    await crawl();
+
+    expect(store.issues.filter((i) => i.type === "MISSING_SITEMAP").map((i) => i.message)).toEqual([
+      "Sitemap blocked by robots.txt",
+    ]);
+  });
+
+  it("still reports a missing sitemap as missing", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nAllow: /\n"),
+      "https://example.com/": page("Home"),
+    };
+
+    await crawl();
+
+    expect(store.issues.filter((i) => i.type === "MISSING_SITEMAP").map((i) => i.message)).toEqual([
+      "No sitemap.xml found",
+    ]);
+  });
+});
+
+describe("redirects onto a Crawl-delay origin that stopped early", () => {
+  it("counts the skip on the redirect target's origin", async () => {
+    process.env.CRAWL_MAX_MINUTES = "1";
+    const links = Array.from({ length: 10 }, (_, i) => `/r${i}`);
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nAllow: /\n"),
+      "https://www.example.com/robots.txt": text("User-agent: *\nCrawl-delay: 20\n"),
+      "https://example.com/": page("Home", links),
+    };
+    for (let i = 0; i < 10; i++) {
+      routes[`https://example.com/r${i}`] = redirect(`https://www.example.com/p${i}`);
+      routes[`https://www.example.com/p${i}`] = page(`P${i}`);
+    }
+
+    await crawl();
+
+    const www = originReport("https://www.example.com");
+    expect(www?.outcome).toBe("stopped-early");
+    expect(www?.skipped).toBeGreaterThan(0);
+    expect(originReport("https://example.com")?.skipped).toBe(0);
+    expect(report()?.skipped).toBe(www?.skipped);
+  });
+});
+
+describe("percent-encoded paths (RFC 9309 2.2.2)", () => {
+  it("matches an encoded unreserved character in the URL against a plain rule", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nDisallow: /secret/\n"),
+      "https://example.com/": page("Home", ["/%73ecret/x", "/%7Euser/y"]),
+      "https://example.com/%73ecret/x": page("X"),
+      "https://example.com/%7Euser/y": page("Y"),
+    };
+
+    await crawl();
+
+    expect(fetched("https://example.com/%73ecret/x")).toBe(false);
+    expect(fetched("https://example.com/%7Euser/y")).toBe(true);
+    expect(report()?.disallowed).toBe(1);
+  });
+
+  it("matches a plain URL against a rule with an encoded unreserved character", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nDisallow: /%73ecret/\n"),
+      "https://example.com/": page("Home", ["/secret/x"]),
+      "https://example.com/secret/x": page("X"),
+    };
+
+    await crawl();
+
+    expect(fetched("https://example.com/secret/x")).toBe(false);
+  });
+
+  it("decodes lowercase hex and encodings in the query string", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nDisallow: /~admin\nDisallow: /search?q=abc\n"),
+      "https://example.com/": page("Home", ["/%7eadmin/x", "/search?q=%61bc"]),
+      "https://example.com/%7eadmin/x": page("X"),
+      "https://example.com/search?q=%61bc": page("S"),
+    };
+
+    await crawl();
+
+    expect(fetched("https://example.com/%7eadmin/x")).toBe(false);
+    expect(fetched("https://example.com/search?q=%61bc")).toBe(false);
+    expect(report()?.disallowed).toBe(2);
+  });
+
+  it("keeps an encoded reserved character distinct from the character", async () => {
+    routes = {
+      "https://example.com/robots.txt": text("User-agent: *\nDisallow: /a%2Fb\n"),
+      "https://example.com/": page("Home", ["/a/b"]),
+      "https://example.com/a/b": page("AB"),
+    };
+
+    await crawl();
+
+    expect(fetched("https://example.com/a/b")).toBe(true);
+  });
+});
