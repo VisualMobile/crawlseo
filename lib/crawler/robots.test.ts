@@ -49,7 +49,7 @@ vi.mock("@/lib/db", () => ({
   },
 }));
 
-import { fetchText, runSiteCrawl } from "./engine";
+import { crawlerDispatcher, fetchText, pinnedLookup, runSiteCrawl } from "./engine";
 
 /* ------------------------------------------------------------------ */
 /*  A fake web: URL -> response                                        */
@@ -166,6 +166,76 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   delete process.env.CRAWL_MAX_MINUTES;
+});
+
+/* ------------------------------------------------------------------ */
+/*  DNS rebinding (#49)                                                */
+/* ------------------------------------------------------------------ */
+
+describe("pinned connections", () => {
+  it("sends every request of a crawl through the pinned dispatcher", async () => {
+    fetchMock.mockClear();
+    routes = {
+      "https://example.com/robots.txt": redirect("https://www.example.com/robots.txt"),
+      "https://www.example.com/robots.txt": text(
+        "User-agent: *\nAllow: /\nSitemap: https://example.com/sitemap_main.xml\n"
+      ),
+      "https://example.com/sitemap_main.xml": redirect("https://example.com/sitemap.xml"),
+      "https://example.com/sitemap.xml": xml(["https://example.com/a"]),
+      "https://example.com/": page("Home", ["/old"]),
+      "https://example.com/a": page("A"),
+      "https://example.com/old": redirect("https://example.com/new"),
+      "https://example.com/new": page("New"),
+    };
+
+    await crawl();
+
+    expect(crawlerDispatcher).toBeDefined();
+    for (const url of [
+      "https://www.example.com/robots.txt",
+      "https://example.com/sitemap.xml",
+      "https://example.com/a",
+      "https://example.com/new",
+    ]) {
+      expect(fetched(url)).toBe(true);
+    }
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(8);
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect({ url, dispatcher: (init as { dispatcher?: unknown }).dispatcher }).toEqual({
+        url,
+        dispatcher: crawlerDispatcher,
+      });
+    }
+  });
+});
+
+describe("a host refused at connect time", () => {
+  it("is reported like a failed pre-flight check, not as an unreachable robots.txt", async () => {
+    // One public and one private record: the pre-flight check sees only the
+    // first, the connection's lookup sees both and refuses.
+    lookup.mockImplementation((async (_host: string, opts?: { all?: boolean }) =>
+      opts?.all
+        ? [{ address: "93.184.216.34", family: 4 }, { address: "10.0.0.5", family: 4 }]
+        : { address: "93.184.216.34", family: 4 }) as never);
+    // What fetch() throws when the dispatcher's lookup fails.
+    const refused = () => () => () =>
+      new Promise<Response>((_, reject) =>
+        pinnedLookup("example.com", { all: true }, (err) => reject(new TypeError("fetch failed", { cause: err })))
+      );
+    routes = { "https://example.com/robots.txt": refused(), "https://example.com/": refused() };
+
+    await crawl();
+
+    expect(store.issues.map((i) => i.type)).not.toContain("MISSING_ROBOTS");
+    expect(store.issues).toContainEqual(
+      expect.objectContaining({
+        url: "https://example.com/",
+        type: "BROKEN_LINK",
+        message: "Blocked: example.com resolves to private/reserved IP",
+      })
+    );
+    expect(fetched("https://example.com/")).toBe(false);
+  });
 });
 
 /* ------------------------------------------------------------------ */
