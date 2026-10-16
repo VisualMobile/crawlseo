@@ -1,9 +1,9 @@
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { redirect } from "next/navigation";
+import Link from "next/link";
 import { PageHeader } from "@/components/ui/page-header";
 import { DeleteSiteButton } from "@/components/sites/delete-site-button";
-import { ApiKeysSection } from "@/components/settings/api-keys-section";
 import { BingSiteSection } from "@/components/settings/bing-site-section";
 import { formatDay } from "@/lib/format";
 
@@ -37,28 +37,17 @@ export default async function SettingsPage({ params }: Props) {
   });
   if (!site || site.userId !== session?.user?.id) redirect("/sites");
 
-  // Check API key status
-  const apiKeys = await db.apiKey.findMany({
-    where: { userId: session.user.id },
-    select: { provider: true, updatedAt: true },
+  // The Bing key is stored per user, in Settings; this page only picks the property.
+  const bingKey = await db.apiKey.findUnique({
+    where: { userId_provider: { userId: session.user.id, provider: "bing" } },
+    select: { id: true },
   });
-  const apiKeyStatus: Record<string, { connected: boolean; updatedAt?: string }> = {
-    dataforseo: { connected: false },
-    google_pagespeed: { connected: false },
-    bing: { connected: false },
-  };
-  for (const key of apiKeys) {
-    apiKeyStatus[key.provider] = {
-      connected: true,
-      updatedAt: key.updatedAt.toISOString(),
-    };
-  }
 
   return (
     <div>
       <PageHeader
-        title="Settings"
-        description="Site configuration and data management."
+        title="Site settings"
+        description={`Configuration and stored data for ${site.domain}. API keys and Google live in Settings and apply to all sites.`}
       />
 
       <div className="space-y-6">
@@ -93,30 +82,32 @@ export default async function SettingsPage({ params }: Props) {
           </dl>
         </div>
 
-        {/* External API keys */}
-        <ApiKeysSection initialStatus={apiKeyStatus} />
-
-        {/* Bing Webmaster property */}
-        <BingSiteSection
-          siteId={siteId}
-          bingSite={site.bingSite}
-          keyConnected={apiKeyStatus.bing.connected}
-        />
+        {/* Bing Webmaster property: only with a Bing key */}
+        {bingKey ? (
+          <BingSiteSection siteId={siteId} bingSite={site.bingSite} />
+        ) : (
+          <p className="panel px-5 py-4 text-sm text-muted-foreground">
+            Bing Webmaster Tools is not connected.{" "}
+            <Link href="/settings?connect=bing#connections" className="text-link font-medium">
+              Connect Bing in Settings
+            </Link>
+          </p>
+        )}
 
         {/* Data summary */}
-        <div className="panel p-5">
-          <h3 className="text-[15px] leading-5 font-semibold text-text-strong">
+        <section aria-labelledby="stored-data-heading">
+          <h3 id="stored-data-heading" className="mb-3 text-[15px] leading-5 font-semibold text-text-strong">
             Stored data
           </h3>
-          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <ul className="panel divide-y divide-border-soft">
             <DataStat label="Keyword records" value={site._count.keywords} />
             <DataStat label="Page records" value={site._count.pages} />
             <DataStat label="Crawls" value={site._count.crawls} />
             <DataStat label="Vitals reports" value={site._count.vitals} />
             <DataStat label="Alert rules" value={site._count.alerts} />
             <DataStat label="Saved keywords" value={site._count.savedKeywords} />
-          </div>
-        </div>
+          </ul>
+        </section>
 
         {/* Danger zone */}
         <div className="panel border-danger/30 p-5">
@@ -138,13 +129,9 @@ export default async function SettingsPage({ params }: Props) {
 
 function DataStat({ label, value }: { label: string; value: number }) {
   return (
-    <div className="rounded-lg border border-border bg-bg px-3 py-2.5">
-      <p className="mono-label text-[11px] text-muted-foreground">
-        {label}
-      </p>
-      <p className="mt-1 font-data text-lg font-medium text-text-strong">
-        {value.toLocaleString()}
-      </p>
-    </div>
+    <li className="flex items-center justify-between gap-4 px-5 py-3 text-sm">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="font-data font-medium text-text-strong">{value.toLocaleString()}</span>
+    </li>
   );
 }
