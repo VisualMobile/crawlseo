@@ -3,48 +3,36 @@
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
+import { fetchJob, isFinished, isSettled, pendingNote, type JobView } from "@/lib/jobs/client";
 import { CrawlFailedNotice } from "./crawl-failed-notice";
 
-interface CrawlStatusPollerProps {
-  siteId: string;
-  crawlId: string;
-}
-
-interface CrawlStatus {
-  id: string;
-  status: string;
-  pagesFound: number;
-  issuesFound: number;
-  healthScore: number | null;
-  startedAt: string | null;
-  finishedAt: string | null;
-  error: string | null;
-}
-
-const isDone = (s: CrawlStatus | null) => s?.status === "COMPLETED" || s?.status === "FAILED";
-
-export function CrawlStatusPoller({ siteId, crawlId }: CrawlStatusPollerProps) {
+/**
+ * A crawl job queued or running: its state, polled until it finished or
+ * failed. `status` is what the server saw when it rendered the page.
+ */
+export function CrawlStatusPoller({ jobId, status }: { jobId: string; status: "QUEUED" | "RUNNING" }) {
   const router = useRouter();
-  const [status, setStatus] = useState<CrawlStatus | null>(null);
+  const [job, setJob] = useState<JobView | null>(null);
 
   const poll = useCallback(async () => {
     try {
-      const res = await fetch(`/api/sites/${siteId}/crawl/${crawlId}/status`);
-      if (!res.ok) return;
-      const data = (await res.json()) as CrawlStatus;
-      setStatus(data);
-      if (isDone(data)) router.refresh();
+      const data = await fetchJob(jobId);
+      if (!data) return;
+      setJob(data);
+      if (isFinished(data)) router.refresh();
     } catch {
       // ignore
     }
-  }, [siteId, crawlId, router]);
+  }, [jobId, router]);
 
-  const done = isDone(status);
+  const done = job ? isFinished(job) : false;
+  // Waiting for an attempt nothing will start: stop polling; Run crawl retries now.
+  const settled = job ? isSettled(job) : false;
 
   useEffect(() => {
-    // Stop once the crawl has finished or failed (the status endpoint marks a
-    // crawl whose process died as FAILED, #57).
-    if (done) return;
+    // Stop once the job has finished or failed (a job whose process died is
+    // queued again or failed by recovery, #57).
+    if (settled) return;
     // First poll right away (from a timer, so no state is set during the effect), then every 3 s.
     const first = setTimeout(poll, 0);
     const interval = setInterval(poll, 3000);
@@ -52,12 +40,20 @@ export function CrawlStatusPoller({ siteId, crawlId }: CrawlStatusPollerProps) {
       clearTimeout(first);
       clearInterval(interval);
     };
-  }, [poll, done]);
+  }, [poll, settled]);
 
-  if (status?.status === "FAILED") {
-    return <CrawlFailedNotice error={status.error} finishedAt={status.finishedAt} />;
+  if (job?.status === "FAILED") {
+    return (
+      <CrawlFailedNotice
+        error={job.crawl?.error ?? job.lastError}
+        finishedAt={job.crawl?.finishedAt ?? job.finishedAt}
+      />
+    );
   }
   if (done) return null;
+
+  const queued = (job?.status ?? status) === "QUEUED";
+  const note = job && pendingNote(job);
 
   return (
     <div role="status"
@@ -65,10 +61,13 @@ export function CrawlStatusPoller({ siteId, crawlId }: CrawlStatusPollerProps) {
       <Loader2 className="size-5 animate-spin text-brand-500" aria-hidden />
       <div>
         <p className="text-sm font-medium text-text-strong">
-          Crawl in progress…
+          {queued ? "Crawl queued" : "Crawl in progress…"}
         </p>
         <p className="text-xs text-muted-foreground">
-          {status?.pagesFound ?? 0} pages found · {status?.issuesFound ?? 0} issues
+          {note ??
+            (queued
+              ? "It starts when the crawler is free."
+              : `${job?.crawl?.pagesFound ?? 0} pages found · ${job?.crawl?.issuesFound ?? 0} issues`)}
         </p>
       </div>
     </div>
