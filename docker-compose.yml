@@ -23,7 +23,7 @@ services:
       retries: 3
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://${POSTGRES_USER:-crawlseo}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-crawlseo}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-crawlseo}:${POSTGRES_PASSWORD:-changeme}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-crawlseo}
       # The worker service below runs crawls, syncs and the schedule; the app
       # only queues them. Without a worker, remove this line (the default,
       # inline, runs jobs in the app).
@@ -59,7 +59,7 @@ services:
       retries: 3
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://${POSTGRES_USER:-crawlseo}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-crawlseo}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-crawlseo}:${POSTGRES_PASSWORD:-changeme}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-crawlseo}
       WORKER_MODE: worker
 
   db:
@@ -72,7 +72,7 @@ services:
       # never uses this mapping; it reaches the database as db:5432 over the
       # compose network. It stays published on loopback so the host-side steps
       # in CONTRIBUTING.md (prisma migrate dev, psql) keep working.
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     environment:
